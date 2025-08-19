@@ -25,7 +25,187 @@ import torch
 import torch.nn as nn
 import onnx
 import onnx.checker as oc
+from torch import Tensor, nn
+from torch.nn import functional as F
+from torch.nn import MultiheadAttention
+from typing import Any, Dict, List, Tuple, Union, Optional
+import pdb
 
+# -----------------------------
+# 0) Symmetric Transformer
+# -----------------------------
+class SftLayer(nn.Module):
+    def __init__(self,
+                 device,
+                 d_edge: int = 128,
+                 d_model: int = 128,
+                 d_ffn: int = 2048,
+                 n_head: int = 8,
+                 dropout: float = 0.1,
+                 update_edge: bool = True) -> None:
+        super(SftLayer, self).__init__()
+        self.device = device
+        self.update_edge = update_edge
+
+        # d_div = 2
+        # d_inter = max(16, min(d_model + d_model + d_edge, d_model)//d_div)
+        self.proj_memory = nn.Sequential(
+            nn.Linear(d_model + d_model + d_edge, d_model, bias=False),
+            # nn.Linear(d_model + d_model + d_edge, d_inter, bias=False),
+            # nn.Linear(d_inter, d_model, bias=False),
+            nn.LayerNorm(d_model, bias=False),
+            nn.ReLU(inplace=True)
+        )
+
+        if self.update_edge:
+            self.proj_edge = nn.Sequential(
+                nn.Linear(d_model, d_edge, bias=False),
+                nn.LayerNorm(d_edge, bias=False),
+                nn.ReLU(inplace=True)
+            )
+            self.norm_edge = nn.LayerNorm(d_edge, bias=False)
+
+        self.multihead_attn = MultiheadAttention(
+            embed_dim=d_model, num_heads=n_head, dropout=dropout, batch_first=False)
+
+        # Feedforward model
+        self.linear1 = nn.Linear(d_model, d_ffn, bias=False)
+        # d_inter = max(16, min(d_model, d_ffn)//d_div)
+        # self.linear1 = nn.Sequential(
+        #     nn.Linear(d_model, d_inter, bias=False),
+        #     nn.Linear(d_inter, d_ffn, bias=False)
+        # )
+        
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(d_ffn, d_model, bias=False)
+        # d_inter = max(16, min(d_ffn, d_model)//d_div)
+        # self.linear2 = nn.Sequential(
+        #     nn.Linear(d_ffn, d_inter, bias=False),
+        #     nn.Linear(d_inter, d_model, bias=False)
+        # )
+
+        self.norm2 = nn.LayerNorm(d_model, bias=False)
+        self.norm3 = nn.LayerNorm(d_model, bias=False)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+        self.activation = nn.ReLU(inplace=True)
+        
+        decoderlayer = nn.TransformerDecoderLayer(d_model, n_head, dim_feedforward=d_ffn, dropout=dropout, batch_first=False)
+        self.decoder = nn.TransformerDecoder(decoderlayer, 1)
+
+    def forward(self,
+                node: Tensor,
+                edge: Tensor,
+                edge_mask: Optional[Tensor]) -> Tensor:
+        '''
+            input:
+                node:       (N, d_model)
+                edge:       (N, N, d_model)
+                edge_mask:  (N, N)
+        '''
+        # update node
+        # pdb.set_trace()
+        x, edge, memory = self._build_memory(node, edge)
+        # print(f"node.shape/edge.shape: {node.shape}/{edge.shape}")
+        # x = self.decoder(x, memory).squeeze() # 'edge_mask' is not considered
+        
+        x_prime, _ = self._mha_block(x, memory, attn_mask=None, key_padding_mask=edge_mask)
+        x = self.norm2(x + x_prime).squeeze()
+        x = self.norm3(x + self._ff_block(x))
+        return x, edge, None
+
+    def _build_memory(self,
+                      node: Tensor,
+                      edge: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        '''
+            input:
+                node:   (N, d_model)
+                edge:   (N, N, d_edge)
+            output:
+                :param  (1, N, d_model)
+                :param  (N, N, d_edge)
+                :param  (N, N, d_model)
+        '''
+        n_token = node.shape[0]
+
+        # 1. build memory
+        src_x = node.unsqueeze(dim=0).repeat([n_token, 1, 1])  # (N, N, d_model)
+        tar_x = node.unsqueeze(dim=1).repeat([1, n_token, 1])  # (N, N, d_model)
+        memory = self.proj_memory(torch.cat([edge, src_x, tar_x], dim=-1))  # (N, N, d_model)
+        # 2. (optional) update edge (with residual)
+        if self.update_edge:
+            edge = self.norm_edge(edge + self.proj_edge(memory))  # (N, N, d_edge)
+
+        return node.unsqueeze(dim=0), edge, memory
+
+    # multihead attention block
+    def _mha_block(self,
+                   x: Tensor,
+                   mem: Tensor,
+                   attn_mask: Optional[Tensor],
+                   key_padding_mask: Optional[Tensor]) -> Tensor:
+        '''
+            input:
+                x:                  [1, N, d_model]
+                mem:                [N, N, d_model]
+                attn_mask:          [N, N]
+                key_padding_mask:   [N, N]
+            output:
+                :param      [1, N, d_model]
+                :param      [N, N]
+        '''
+        x, _ = self.multihead_attn(x, mem, mem,
+                                   attn_mask=attn_mask,
+                                   key_padding_mask=key_padding_mask,
+                                   need_weights=False)  # return average attention weights
+        return self.dropout2(x), None
+
+    # feed forward block
+    def _ff_block(self,
+                  x: Tensor) -> Tensor:
+        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
+        return self.dropout3(x)
+
+class SymmetricFusionTransformer(nn.Module):
+    def __init__(self,
+                 device,
+                 d_model: int = 128,
+                 d_edge: int = 128,
+                 n_head: int = 8,
+                 n_layer: int = 6,
+                 dropout: float = 0.1,
+                 update_edge: bool = True):
+        super(SymmetricFusionTransformer, self).__init__()
+        self.device = device
+
+        fusion = []
+        for i in range(n_layer):
+            need_update_edge = False if i == n_layer - 1 else update_edge
+            fusion.append(SftLayer(device=device,
+                                   d_edge=d_edge,
+                                   d_model=d_model,
+                                   d_ffn=d_model*2,
+                                   n_head=n_head,
+                                   dropout=dropout,
+                                   update_edge=need_update_edge))
+        self.fusion = nn.ModuleList(fusion)
+
+    def forward(self, x: Tensor, edge: Tensor, edge_mask: Tensor) -> Tensor:
+        '''
+            x: (N, d_model)
+            edge: (d_model, N, N)
+            edge_mask: (N, N)
+        '''
+        # attn_multilayer = []
+        ##########################################
+        # Only use save tensor API when exporting
+        ##########################################
+        # save_tensor_inputs_for_onnx([x, edge, edge_mask],
+        #                     ["SftLayer_node.pt", "SftLayer_edge.pt", "SftLayer_edge_mask.pt"])
+        for mod in self.fusion:
+            x, edge, _ = mod(x, edge, edge_mask)
+            # attn_multilayer.append(attn)
+        return x, None
 
 # -----------------------------
 # 1) Parallel MatMul (no bias)
@@ -146,14 +326,39 @@ def export_onnx(model: nn.Module,
     print(f"    inputs : {[i.name + str(i.type.tensor_type.shape.dim[0].dim_param or i.type.tensor_type.shape.dim[0].dim_value) for i in m.graph.input]}")
     print(f"    outputs: {[o.name for o in m.graph.output]}")
 
+class SimplConverter():
+    def __init__(self):
+        super().__init__()
+
+    def onnx_convert(self, model, filepath, N=300):
+        model.to("cpu")
+        model.eval()
+
+        if isinstance(model, SymmetricFusionTransformer):
+            st_in_tokens = torch.rand(N, 128, dtype=torch.float32)      # x: (N, d_model)
+            st_in_edge = torch.rand(N, N, 128, dtype=torch.float32)     # edge: (N, N, d_edge)
+            st_in_mask = torch.randint(0, 2, (N, N)).bool()             # edge_mask: (N, N)
+            
+            input_sample = (st_in_tokens, st_in_edge, st_in_mask)
+            input_names = ['tokens', 'rpe', 'rpes']
+            output_names = ['out']
+            
+        torch.onnx.export(
+                        model,
+                        input_sample,
+                        filepath, 
+                        input_names=input_names,
+                        output_names=output_names,
+                        do_constant_folding=True,
+                        export_params=True)
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--outdir", type=str, default="./onnx_out")
     ap.add_argument("--batch", type=int, default=4)
-    ap.add_argument("--in-feat", type=int, default=128)
-    ap.add_argument("--m1", type=int, default=64)
-    ap.add_argument("--m2", type=int, default=96)
+    ap.add_argument("--in-feat", type=int, default=8192)
+    ap.add_argument("--m1", type=int, default=8192)
+    ap.add_argument("--m2", type=int, default=8192)
     ap.add_argument("--m3", type=int, default=32)
     ap.add_argument("--opset", type=int, default=13)
     ap.add_argument("--seed", type=int, default=42)
@@ -169,6 +374,11 @@ def main():
     N, K = args.batch, args.in_feat
     x = torch.randn(N, K, dtype=torch.float32)
 
+    # 0) SymmetricFT.onnx
+    st_model = SymmetricFusionTransformer('cuda:0')
+    converter = SimplConverter()
+    converter.onnx_convert(st_model, outdir / "SymmetricFT.onnx")
+    
     # 1) parallel_matmul.onnx
     m1 = ParallelMatMul(in_features=K, m1=args.m1, m2=args.m2)
     export_onnx(
@@ -178,28 +388,28 @@ def main():
         names=["Y1", "Y2"]
     )
 
-    # 2) parallel_gemm.onnx
-    m2 = ParallelGemm(in_features=K, m1=args.m1, m2=args.m2)
-    export_onnx(
-        m2, x, outdir / "parallel_gemm.onnx",
-        opset=args.opset,
-        dynamic=not args.no_dynamic,
-        names=["Y1", "Y2"]
-    )
+    # # 2) parallel_gemm.onnx
+    # m2 = ParallelGemm(in_features=K, m1=args.m1, m2=args.m2)
+    # export_onnx(
+    #     m2, x, outdir / "parallel_gemm.onnx",
+    #     opset=args.opset,
+    #     dynamic=not args.no_dynamic,
+    #     names=["Y1", "Y2"]
+    # )
 
-    # 3) mixed_dependent.onnx
-    m3 = MixedDependent(in_features=K, m1=args.m1, m2=args.m2, m3=args.m3, add_dep_matmul=True)
-    export_onnx(
-        m3, x, outdir / "mixed_dependent.onnx",
-        opset=args.opset,
-        dynamic=not args.no_dynamic,
-        names=["O1", "O2", "O3"]
-    )
+    # # 3) mixed_dependent.onnx
+    # m3 = MixedDependent(in_features=K, m1=args.m1, m2=args.m2, m3=args.m3, add_dep_matmul=True)
+    # export_onnx(
+    #     m3, x, outdir / "mixed_dependent.onnx",
+    #     opset=args.opset,
+    #     dynamic=not args.no_dynamic,
+    #     names=["O1", "O2", "O3"]
+    # )
 
     print("\n[hint] 이제 수평 병합 스크립트를 적용해보세요:")
     print("  python hfuse.py --in ./onnx_out/parallel_matmul.onnx --out ./onnx_out/parallel_matmul_fused.onnx")
-    print("  python hfuse.py --in ./onnx_out/parallel_gemm.onnx   --out ./onnx_out/parallel_gemm_fused.onnx")
-    print("  python hfuse.py --in ./onnx_out/mixed_dependent.onnx --out ./onnx_out/mixed_dependent_fused.onnx")
+    # print("  python hfuse.py --in ./onnx_out/parallel_gemm.onnx   --out ./onnx_out/parallel_gemm_fused.onnx")
+    # print("  python hfuse.py --in ./onnx_out/mixed_dependent.onnx --out ./onnx_out/mixed_dependent_fused.onnx")
 
 
 if __name__ == "__main__":
