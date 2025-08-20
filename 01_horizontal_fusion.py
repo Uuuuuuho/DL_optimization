@@ -34,6 +34,13 @@ def get_const_array(t: gs.Tensor) -> np.ndarray:
 def same_variable(a: gs.Tensor, b: gs.Tensor) -> bool:
     return a is b  # same object identity is fine in GS graph
 
+# Global hashable key helpers (name if available, else id)
+def tkey(t: gs.Tensor):
+    return getattr(t, "name", None) or id(t)
+
+def nkey(n: gs.Node):
+    return getattr(n, "name", None) or id(n)
+
 
 # ------------------------------
 # Build dependency graph (dataflow DAG)
@@ -434,15 +441,15 @@ def prune_dead_nodes(g: gs.Graph, max_passes: int = 3, verbose: bool = False) ->
     """Remove nodes whose outputs are unused by any node and are not graph outputs.
     Runs a few passes to reach a small fixed point. Conservative and op-agnostic.
     """
-    def count_consumers() -> Dict[gs.Tensor, int]:
-        cnt: Dict[gs.Tensor, int] = defaultdict(int)
+    def count_consumers() -> Dict[object, int]:
+        cnt: Dict[object, int] = defaultdict(int)
         for nd in g.nodes:
             for inp in (nd.inputs or []):
                 if isinstance(inp, gs.Tensor):
-                    cnt[inp] += 1
+                    cnt[tkey(inp)] += 1
         for out in (g.outputs or []):
             if isinstance(out, gs.Tensor):
-                cnt[out] += 1
+                cnt[tkey(out)] += 1
         return cnt
 
     passes = 0
@@ -460,7 +467,7 @@ def prune_dead_nodes(g: gs.Graph, max_passes: int = 3, verbose: bool = False) ->
             for t in outs:
                 if t in (g.outputs or []):
                     all_unused = False; break
-                if cons.get(t, 0) > 0:
+                if cons.get(tkey(t), 0) > 0:
                     all_unused = False; break
             if all_unused:
                 to_remove.append(nd)
@@ -599,22 +606,23 @@ def fuse_gemm_group(A: gs.Tensor, nodes: List[gs.Node], g: gs.Graph, verbose: bo
 
     # Optional cleanup: remove orphan Split producers that fed the old nodes
     try:
-        # Build quick maps
+        # Build quick maps (use hashable keys)
         prod_by_tensor = {}
         for nd in g.nodes:
             for t in nd.outputs or []:
                 if isinstance(t, gs.Tensor):
-                    prod_by_tensor[t] = nd
+                    prod_by_tensor[tkey(t)] = nd
         # Count consumers for a tensor
         def _consumer_count(t: gs.Tensor) -> int:
+            k = tkey(t)
             cnt = 0
             for nd in g.nodes:
                 for inp in (nd.inputs or []):
-                    if inp is t:
+                    if isinstance(inp, gs.Tensor) and tkey(inp) == k:
                         cnt += 1
             # graph outputs also count
             for out in (g.outputs or []):
-                if out is t:
+                if isinstance(out, gs.Tensor) and tkey(out) == k:
                     cnt += 1
             return cnt
         # Candidates: producers of each old A input
@@ -622,7 +630,7 @@ def fuse_gemm_group(A: gs.Tensor, nodes: List[gs.Node], g: gs.Graph, verbose: bo
         for old_node in nodes:
             if old_node.inputs:
                 a_in = old_node.inputs[0]
-                p = prod_by_tensor.get(a_in)
+                p = prod_by_tensor.get(tkey(a_in))
                 if p is not None and p.op == "Split":
                     split_cands.add(p)
         # After rewiring, if Split outputs are unused, remove the Split
@@ -653,12 +661,12 @@ def try_remove_split_before_gemm_fusion(A: gs.Tensor, nodes: List[gs.Node], g: g
     """
     if not nodes:
         return False
-    # Build producer map: tensor -> producer node
+    # Build producer map: tensor_key(name or id) -> producer node
     prod_by_t = {}
     for nd in g.nodes:
         for t in nd.outputs or []:
             if isinstance(t, gs.Tensor):
-                prod_by_t[t] = nd
+                prod_by_t[tkey(t)] = nd
 
     # Check all nodes' A input comes from the same Split with input A
     split = None
@@ -702,7 +710,7 @@ def try_remove_split_before_gemm_fusion(A: gs.Tensor, nodes: List[gs.Node], g: g
     per_node_idx = {}
     for n in nodes:
         a_in = n.inputs[0]
-        p = prod_by_t.get(a_in)
+        p = prod_by_t.get(tkey(a_in))
         if p is None or p.op != "Split":
             return False
         # Split's input must be A
@@ -719,7 +727,7 @@ def try_remove_split_before_gemm_fusion(A: gs.Tensor, nodes: List[gs.Node], g: g
             idx = list(split.outputs or []).index(a_in)
         except ValueError:
             return False
-        per_node_idx[n] = idx
+    per_node_idx[nkey(n)] = idx
 
     # K_total is sum of sizes
     K_total = sum(split_sizes) if split_sizes else None
@@ -729,7 +737,7 @@ def try_remove_split_before_gemm_fusion(A: gs.Tensor, nodes: List[gs.Node], g: g
     # Rewrite each node: pad B to K_total along K dimension and set input to A
     changed = False
     for n in nodes:
-        idx = per_node_idx[n]
+        idx = per_node_idx[nkey(n)]
         off = split_offsets[idx]
         K_i = split_sizes[idx]
         # get attrs
@@ -839,10 +847,6 @@ def horizontal_fusion_with_dependency(in_path: str,
                 print(f"gm_groups: { {k: len(v[1]) for k,v in gm_groups.items()} }")
             for _, (A, nodes) in gm_groups.items():
                 # pre-rewrite: if nodes are fed by the same Split(A), remove Split by zero-padding B
-                if try_remove_split_before_gemm_fusion(A, nodes, graph, verbose=verbose):
-                    graph.toposort()
-                    prune_dead_nodes(graph, verbose=False)
-                    dep = DepGraph(graph)
                 for group in filter_independent_siblings(nodes, dep):
                     if fuse_gemm_group(A, group, graph, verbose=verbose):
                         any_change = True
