@@ -125,7 +125,42 @@ class DepGraph:
 # Candidate grouping (MatMul/Gemm) with independence check
 # ------------------------------
 def collect_matmul_groups(g: gs.Graph) -> Dict[object, Tuple[gs.Variable, List[gs.Node]]]:
-    # Return mapping: key -> (A_variable, [nodes]) where key is A.name or id(A)
+    # Return mapping: key -> (A_variable, [nodes]) where key is canonicalized A
+    def _tensor_key(t: gs.Tensor):
+        return getattr(t, "name", None) or id(t)
+
+    # Build producer map to unwrap Identity chains
+    prod_by_t = {}
+    for node in g.nodes:
+        for t in node.outputs:
+            if isinstance(t, gs.Tensor):
+                prod_by_t[_tensor_key(t)] = node
+
+    def _unwrap_identity_or_split(t: gs.Tensor) -> gs.Tensor:
+        seen = 0
+        cur = t
+        while seen < 16 and isinstance(cur, gs.Tensor):
+            p = prod_by_t.get(_tensor_key(cur))
+            if p is None or not p.inputs:
+                break
+            if p.op == "Identity":
+                src = p.inputs[0]
+                if not isinstance(src, gs.Tensor):
+                    break
+                cur = src
+                seen += 1
+                continue
+            if p.op == "Split":
+                # treat split outputs as sharing the same base input for grouping
+                src = p.inputs[0]
+                if not isinstance(src, gs.Tensor):
+                    break
+                cur = src
+                seen += 1
+                continue
+            break
+        return cur
+
     nodes_map: Dict[object, List[gs.Node]] = defaultdict(list)
     key_to_A: Dict[object, gs.Variable] = {}
     for n in g.nodes:
@@ -133,16 +168,18 @@ def collect_matmul_groups(g: gs.Graph) -> Dict[object, Tuple[gs.Variable, List[g
             continue
         if len(n.inputs) != 2:
             continue
-        A, B = n.inputs
-        if not isinstance(A, gs.Variable):
+        A_in, B_in = n.inputs
+        A_in = _unwrap_identity_or_split(A_in)
+        B_in = _unwrap_identity_or_split(B_in)
+        if not isinstance(A_in, gs.Variable):
             continue
-        if not is_const(B):
+        if not is_const(B_in):
             continue
-        Barr = get_const_array(B)
+        Barr = get_const_array(B_in)
         if Barr.ndim != 2:
             continue
-        key = getattr(A, "name", None) or id(A)
-        key_to_A[key] = A
+        key = getattr(A_in, "name", None) or id(A_in)
+        key_to_A[key] = A_in
         nodes_map[key].append(n)
     return {k: (key_to_A[k], v) for k, v in nodes_map.items()}
 
@@ -157,19 +194,30 @@ def collect_gemm_groups(g: gs.Graph) -> Dict[object, Tuple[gs.Variable, List[gs.
             if isinstance(t, gs.Tensor):
                 prod_by_t[_tensor_key(t)] = node
 
-    def _unwrap_identity(t: gs.Tensor) -> gs.Tensor:
+    def _unwrap_identity_or_split(t: gs.Tensor) -> gs.Tensor:
         # Walk back through chains of Identity producers to find the canonical source tensor
         seen = 0
         cur = t
         while seen < 16 and isinstance(cur, gs.Tensor):
             p = prod_by_t.get(_tensor_key(cur))
-            if p is None or p.op != "Identity" or not p.inputs:
+            if p is None or not p.inputs:
                 break
-            src = p.inputs[0]
-            if not isinstance(src, gs.Tensor):
-                break
-            cur = src
-            seen += 1
+            if p.op == "Identity":
+                src = p.inputs[0]
+                if not isinstance(src, gs.Tensor):
+                    break
+                cur = src
+                seen += 1
+                continue
+            if p.op == "Split":
+                # Consider outputs of the same Split as sharing the input for grouping
+                src = p.inputs[0]
+                if not isinstance(src, gs.Tensor):
+                    break
+                cur = src
+                seen += 1
+                continue
+            break
         return cur
     
     def gemm_with_const_weights(n: gs.Node) -> bool:
@@ -192,8 +240,8 @@ def collect_gemm_groups(g: gs.Graph) -> Dict[object, Tuple[gs.Variable, List[gs.
     for n in g.nodes:
         if gemm_with_const_weights(n):
             A = n.inputs[0]
-            # Canonicalize A by unwrapping Identity chains
-            A = _unwrap_identity(A)
+            # Canonicalize A by unwrapping Identity and Split chains
+            A = _unwrap_identity_or_split(A)
             key = getattr(A, "name", None) or id(A)
             key_to_A[key] = A
             nodes_map[key].append(n)
@@ -213,10 +261,8 @@ def filter_independent_siblings(nodes: List[gs.Node], dep: DepGraph) -> List[Lis
     for i in range(N):
         for j in range(i+1, N):
             a, b = nodes[i], nodes[j]
-            dep_ab = dep.has_path(a, b)
-            dep_ba = dep.has_path(b, a)
-            if dep_ab or dep_ba:
-                conflict[i][j] = conflict[j][i] = True
+            conflict[i][j] = dep.has_path(a, b)
+            conflict[j][i] = dep.has_path(b, a)
 
     # Greedy partition into independent groups
     unused = set(range(N))
@@ -271,6 +317,36 @@ def fuse_matmul_group(A: gs.Tensor, nodes: List[gs.Node], g: gs.Graph, verbose: 
     _Aname = getattr(A, "name", None) or "A"
     W_cat_c = gs.Constant(name=f"{_Aname}_Wcat", values=W_cat)
 
+    # Detect optional bias Adds that immediately consume each MatMul
+    bias_list = []  # may contain None if no bias for that node
+    add_nodes_map = {}  # old_matmul_node -> add_node (if exists)
+    has_any_bias = False
+    for n, B in zip(nodes, B_list):
+        bias_arr = None
+        add_node = None
+        # find consumers of this matmul output
+        mat_out = n.outputs[0]
+        consumers = [nd for nd in g.nodes if nd.inputs and any(inp is mat_out for inp in nd.inputs)]
+        if len(consumers) == 1 and consumers[0].op == "Add":
+            cand = consumers[0]
+            # identify constant input among Add inputs
+            const_inp = None
+            for inp in cand.inputs:
+                if is_const(inp):
+                    const_inp = inp
+                    break
+            if const_inp is not None:
+                carr = get_const_array(const_inp)
+                # accept 1D bias whose length matches output dim (M)
+                M = B.shape[1]
+                if carr.ndim == 1 and carr.shape[0] == M:
+                    bias_arr = carr
+                    add_node = cand
+        bias_list.append(bias_arr)
+        if add_node is not None:
+            add_nodes_map[n] = add_node
+            has_any_bias = True
+
     # New MatMul
     Y_cat = gs.Variable(name=f"{_Aname}_Ycat_mm", dtype=B_list[0].dtype)
     mm_cat = gs.Node(op="MatMul", inputs=[A, W_cat_c], outputs=[Y_cat])
@@ -279,12 +355,33 @@ def fuse_matmul_group(A: gs.Tensor, nodes: List[gs.Node], g: gs.Graph, verbose: 
     splits = [b.shape[1] for b in B_list]
     split_sizes_c = gs.Constant(name=f"{_Aname}_split_sizes_mm", values=np.array(splits, dtype=np.int64))
     split_outs = []
-    for n in nodes:
+    for idx, n in enumerate(nodes):
         tgt = gs.Variable(name=f"{n.outputs[0].name}_fused", dtype=B_list[0].dtype, shape=n.outputs[0].shape)
         split_outs.append(tgt)
     split_node = gs.Node(op="Split", inputs=[Y_cat, split_sizes_c], outputs=split_outs, attrs={"axis": -1})
 
-    # Insert & rewire
+    # If biases exist, create Add nodes that add per-split bias constants
+    add_outs = []
+    add_nodes = []
+    if has_any_bias:
+        for idx, b in enumerate(bias_list):
+            if b is None:
+                # no bias for this slot -> passthrough (use split_out directly)
+                add_outs.append(split_outs[idx])
+            else:
+                bias_c = gs.Constant(name=f"{_Aname}_bias_{idx}", values=b)
+                add_out = gs.Variable(name=f"{split_outs[idx].name}_with_bias", dtype=B_list[0].dtype, shape=split_outs[idx].shape)
+                add_node = gs.Node(op="Add", inputs=[split_outs[idx], bias_c], outputs=[add_out])
+                add_nodes.append((bias_c, add_node))
+                add_outs.append(add_out)
+
+    # Insert new nodes (do not append Constant tensors to g.nodes; only nodes)
+    new_nodes = [mm_cat, split_node]
+    if has_any_bias:
+        for _, add_n in add_nodes:
+            new_nodes.append(add_n)
+    g.nodes += new_nodes
+
     # Helper: replace all consumer inputs from old tensor to new tensor
     def _rewire_tensor(old_t: gs.Tensor, new_t: gs.Tensor):
         # Rewire node inputs in place
@@ -299,22 +396,88 @@ def fuse_matmul_group(A: gs.Tensor, nodes: List[gs.Node], g: gs.Graph, verbose: 
                 if out is old_t:
                     g.outputs[i] = new_t
 
-    g.nodes += [mm_cat, split_node]
-    for old_node, new_out in zip(nodes, split_outs):
-        old_out = old_node.outputs[0]
-        _rewire_tensor(old_out, new_out)
-    # Explicitly remove only the fused MatMul nodes (preserve others like Relu)
+    # Rewire original outputs (may be from MatMul directly or from Add)
+    for old_node, new_out in zip(nodes, add_outs if has_any_bias else split_outs):
+        # determine the original public-facing tensor to replace
+        orig_final = old_node.outputs[0]
+        # if there was an Add consuming the matmul, use that Add's output as the original final
+        add_n = add_nodes_map.get(old_node)
+        if add_n is not None:
+            orig_final = add_n.outputs[0]
+        _rewire_tensor(orig_final, new_out)
+
+    # Remove old MatMul and their Add nodes (if any)
     for old_node in nodes:
         try:
             if old_node in g.nodes:
                 g.nodes.remove(old_node)
         except Exception:
             pass
+        add_n = add_nodes_map.get(old_node)
+        if add_n is not None:
+            try:
+                if add_n in g.nodes:
+                    g.nodes.remove(add_n)
+            except Exception:
+                pass
 
     if verbose:
         names = [n.name or n.outputs[0].name for n in nodes]
         print(f"  [MatMul] fused {len(nodes)} nodes: {names}")
     return True
+
+
+# ------------------------------
+# Cleanup: remove trivially dead nodes
+# ------------------------------
+def prune_dead_nodes(g: gs.Graph, max_passes: int = 3, verbose: bool = False) -> None:
+    """Remove nodes whose outputs are unused by any node and are not graph outputs.
+    Runs a few passes to reach a small fixed point. Conservative and op-agnostic.
+    """
+    def count_consumers() -> Dict[gs.Tensor, int]:
+        cnt: Dict[gs.Tensor, int] = defaultdict(int)
+        for nd in g.nodes:
+            for inp in (nd.inputs or []):
+                if isinstance(inp, gs.Tensor):
+                    cnt[inp] += 1
+        for out in (g.outputs or []):
+            if isinstance(out, gs.Tensor):
+                cnt[out] += 1
+        return cnt
+
+    passes = 0
+    while passes < max_passes:
+        passes += 1
+        cons = count_consumers()
+        to_remove = []
+        for nd in g.nodes:
+            outs = [t for t in (nd.outputs or []) if isinstance(t, gs.Tensor)]
+            if not outs:
+                # nodes with no outputs are removable
+                to_remove.append(nd)
+                continue
+            all_unused = True
+            for t in outs:
+                if t in (g.outputs or []):
+                    all_unused = False; break
+                if cons.get(t, 0) > 0:
+                    all_unused = False; break
+            if all_unused:
+                to_remove.append(nd)
+        if not to_remove:
+            break
+        for nd in to_remove:
+            try:
+                g.nodes.remove(nd)
+                if verbose:
+                    print(f"[prune] removed dead node: {nd.name or nd.op}")
+            except Exception:
+                pass
+    # reorder after pruning
+    try:
+        g.toposort()
+    except Exception:
+        pass
 
 
 def fuse_gemm_group(A: gs.Tensor, nodes: List[gs.Node], g: gs.Graph, verbose: bool = True) -> bool:
@@ -434,11 +597,187 @@ def fuse_gemm_group(A: gs.Tensor, nodes: List[gs.Node], g: gs.Graph, verbose: bo
         except Exception:
             pass
 
+    # Optional cleanup: remove orphan Split producers that fed the old nodes
+    try:
+        # Build quick maps
+        prod_by_tensor = {}
+        for nd in g.nodes:
+            for t in nd.outputs or []:
+                if isinstance(t, gs.Tensor):
+                    prod_by_tensor[t] = nd
+        # Count consumers for a tensor
+        def _consumer_count(t: gs.Tensor) -> int:
+            cnt = 0
+            for nd in g.nodes:
+                for inp in (nd.inputs or []):
+                    if inp is t:
+                        cnt += 1
+            # graph outputs also count
+            for out in (g.outputs or []):
+                if out is t:
+                    cnt += 1
+            return cnt
+        # Candidates: producers of each old A input
+        split_cands = set()
+        for old_node in nodes:
+            if old_node.inputs:
+                a_in = old_node.inputs[0]
+                p = prod_by_tensor.get(a_in)
+                if p is not None and p.op == "Split":
+                    split_cands.add(p)
+        # After rewiring, if Split outputs are unused, remove the Split
+        for sp in list(split_cands):
+            outs = list(sp.outputs or [])
+            if outs and all(_consumer_count(t) == 0 for t in outs):
+                try:
+                    g.nodes.remove(sp)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
     if verbose:
         names = [n.name or n.outputs[0].name for n in nodes]
         print(f"  [Gemm] fused {len(nodes)} nodes: {names}")
     return True
 
+
+# ------------------------------
+# Pre-fusion rewrite: remove Split before GEMMs by zero-padding weights
+# ------------------------------
+def try_remove_split_before_gemm_fusion(A: gs.Tensor, nodes: List[gs.Node], g: gs.Graph, verbose: bool = False) -> bool:
+    """
+    If all GEMMs in nodes take as input different outputs of the same Split whose input is A,
+    rewrite those GEMMs to consume A directly with zero-padded B so that Split becomes unnecessary.
+    Return True if any change was made.
+    """
+    if not nodes:
+        return False
+    # Build producer map: tensor -> producer node
+    prod_by_t = {}
+    for nd in g.nodes:
+        for t in nd.outputs or []:
+            if isinstance(t, gs.Tensor):
+                prod_by_t[t] = nd
+
+    # Check all nodes' A input comes from the same Split with input A
+    split = None
+    split_offsets = None  # list of cumulative offsets per output index
+    split_sizes = None    # list of sizes per output index
+    def get_split_info(sp: gs.Node):
+        nonlocal split_offsets, split_sizes
+        # determine per-output sizes along the last dimension
+        sizes = None
+        # prefer explicit split sizes from second input constant
+        if len(sp.inputs) >= 2 and is_const(sp.inputs[1]):
+            arr = get_const_array(sp.inputs[1])
+            if arr.ndim == 1:
+                sizes = [int(x) for x in arr.tolist()]
+        if sizes is None:
+            # fallback: use output tensor shapes
+            sizes = []
+            for ot in sp.outputs or []:
+                shp = getattr(ot, "shape", None)
+                if isinstance(shp, (list, tuple)) and len(shp) >= 1 and isinstance(shp[-1], int):
+                    sizes.append(int(shp[-1]))
+                else:
+                    # cannot determine
+                    return False
+        split_sizes = sizes
+        # compute offsets
+        offs = []
+        acc = 0
+        for s in sizes:
+            offs.append(acc)
+            acc += s
+        split_offsets = offs
+        return True
+
+    a_input = A
+    # verify gs.Tensor
+    if not isinstance(a_input, gs.Tensor):
+        return False
+
+    # Collect mapping for each node
+    per_node_idx = {}
+    for n in nodes:
+        a_in = n.inputs[0]
+        p = prod_by_t.get(a_in)
+        if p is None or p.op != "Split":
+            return False
+        # Split's input must be A
+        if not p.inputs or p.inputs[0] is not a_input:
+            return False
+        if split is None:
+            split = p
+            if not get_split_info(split):
+                return False
+        elif split is not p:
+            return False
+        # find output index
+        try:
+            idx = list(split.outputs or []).index(a_in)
+        except ValueError:
+            return False
+        per_node_idx[n] = idx
+
+    # K_total is sum of sizes
+    K_total = sum(split_sizes) if split_sizes else None
+    if K_total is None:
+        return False
+
+    # Rewrite each node: pad B to K_total along K dimension and set input to A
+    changed = False
+    for n in nodes:
+        idx = per_node_idx[n]
+        off = split_offsets[idx]
+        K_i = split_sizes[idx]
+        # get attrs
+        tB = int(cast(Union[int, float, str], n.attrs.get("transB", 0)))
+        # get B and optional C
+        B = get_const_array(n.inputs[1])
+        if tB == 0:
+            # B shape [K_i, M]
+            M = B.shape[1]
+            B_pad = np.zeros((K_total, M), dtype=B.dtype)
+            B_pad[off:off+K_i, :] = B
+        else:
+            # B shape [M, K_i]
+            M = B.shape[0]
+            B_pad = np.zeros((M, K_total), dtype=B.dtype)
+            B_pad[:, off:off+K_i] = B
+        # replace B with padded constant
+        B_new = gs.Constant(name=f"{getattr(a_input, 'name', 'A')}_Bpad_{idx}", values=B_pad)
+        n.inputs[1] = B_new
+        # set A input to pre-split tensor
+        n.inputs[0] = a_input
+        changed = True
+
+    if changed:
+        # If split outputs are now unused, remove the split
+        try:
+            def _consumer_count(t: gs.Tensor) -> int:
+                cnt = 0
+                for nd in g.nodes:
+                    for inp in (nd.inputs or []):
+                        if inp is t:
+                            cnt += 1
+                for out in (g.outputs or []):
+                    if out is t:
+                        cnt += 1
+                return cnt
+            if split is not None:
+                outs = list(split.outputs or [])
+                if outs and all(_consumer_count(t) == 0 for t in outs):
+                    try:
+                        g.nodes.remove(split)
+                        if verbose:
+                            print(f"  [Gemm] removed Split before fusion: {split.name or 'Split'}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    return changed
 
 # ------------------------------
 # Main fusion pipeline
@@ -469,33 +808,52 @@ def horizontal_fusion_with_dependency(in_path: str,
         dep.dump_summary(limit=15)
 
     changed = False
-
-    # 1) MatMul groups by shared A
-    if try_matmul:
-        mm_groups = collect_matmul_groups(graph)
-        print(f"mm_groups: {mm_groups}")
-        for _, (A, nodes) in mm_groups.items():
-            # Partition into independent subsets
-            for group in filter_independent_siblings(nodes, dep):
-                # Optional: further sanity checks can be added here
-                changed |= fuse_matmul_group(A, group, graph, verbose=verbose)
-
-    # Rebuild dep graph if changed, before Gemm (avoid cleanup to preserve non-contributing nodes)
-    if changed:
-        graph.toposort()
+    any_change = True
+    iter_cnt = 0
+    # Run passes to a fixed point so later groups also get considered after graph changes
+    while any_change and iter_cnt < 6:
+        any_change = False
+        iter_cnt += 1
+        if verbose:
+            print(f"[pass] iteration {iter_cnt}")
+        # Recompute dep each pass
         dep = DepGraph(graph)
+        # 1) MatMul groups by shared A
+        if try_matmul:
+            mm_groups = collect_matmul_groups(graph)
+            if verbose:
+                print(f"mm_groups: { {k: len(v[1]) for k,v in mm_groups.items()} }")
+            for _, (A, nodes) in mm_groups.items():
+                for group in filter_independent_siblings(nodes, dep):
+                    if fuse_matmul_group(A, group, graph, verbose=verbose):
+                        any_change = True
+                        changed = True
+                        graph.toposort()
+                        prune_dead_nodes(graph, verbose=False)
+                        dep = DepGraph(graph)
 
-    # 2) Gemm groups by shared A
-    if try_gemm:
-        gm_groups = collect_gemm_groups(graph)
-        print(f"gm_groups: {gm_groups}")
-        for _, (A, nodes) in gm_groups.items():
-            for group in filter_independent_siblings(nodes, dep):
-                print(f"group: {group}")
-                changed |= fuse_gemm_group(A, group, graph, verbose=verbose)
+        # 2) Gemm groups by shared A
+        if try_gemm:
+            gm_groups = collect_gemm_groups(graph)
+            if verbose:
+                print(f"gm_groups: { {k: len(v[1]) for k,v in gm_groups.items()} }")
+            for _, (A, nodes) in gm_groups.items():
+                # pre-rewrite: if nodes are fed by the same Split(A), remove Split by zero-padding B
+                if try_remove_split_before_gemm_fusion(A, nodes, graph, verbose=verbose):
+                    graph.toposort()
+                    prune_dead_nodes(graph, verbose=False)
+                    dep = DepGraph(graph)
+                for group in filter_independent_siblings(nodes, dep):
+                    if fuse_gemm_group(A, group, graph, verbose=verbose):
+                        any_change = True
+                        changed = True
+                        graph.toposort()
+                        prune_dead_nodes(graph, verbose=False)
+                        dep = DepGraph(graph)
 
     # Finalize (avoid cleanup to preserve nodes like Relu that may be disconnected from outputs)
     graph.toposort()
+    prune_dead_nodes(graph, verbose=False)
     ops_after = _op_hist(graph)
     if verbose:
         print("[ops] after:", ops_after)
@@ -519,8 +877,8 @@ def horizontal_fusion_with_dependency(in_path: str,
 # ------------------------------
 def parse_args():
     ap = argparse.ArgumentParser(description="Horizontal Fusion with Dependency Analysis (MatMul/Gemm)")
-    ap.add_argument("--in", dest="in_path", type=str, required=False, default="onnx_out/parallel_gemm.onnx")
-    ap.add_argument("--out", dest="out_path", type=str, required=False, default="onnx_out/parallel_gemm_fused.onnx")
+    ap.add_argument("--in", dest="in_path", type=str, required=False, default="onnx_out/parallel_matmul.onnx")
+    ap.add_argument("--out", dest="out_path", type=str, required=False, default="onnx_out/parallel_matmul_fused.onnx")
     ap.add_argument("--no-matmul", action="store_true", help="disable MatMul fusion")
     ap.add_argument("--no-gemm", action="store_true", help="disable Gemm fusion")
     return ap.parse_args()

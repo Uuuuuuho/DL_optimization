@@ -217,15 +217,30 @@ class ParallelMatMul(nn.Module):
       Y2 = X @ W2   (W2: [K, M2])
     Return: (Y1, Y2)
     """
-    def __init__(self, in_features: int, m1: int, m2: int):
+    def __init__(self, x: int, in_features: int, m1: int, m2: int):
         super().__init__()
         # bias 없는 선형 연산을 'MatMul'로 내보내기 위해 torch.matmul 사용
         self.W1 = nn.Parameter(torch.randn(in_features, m1) * 0.02)
         self.W2 = nn.Parameter(torch.randn(in_features, m2) * 0.02)
+        
+        self.fc1 = nn.Sequential(
+            nn.Linear(x, in_features),
+            nn.Linear(in_features, in_features),
+            nn.Linear(in_features, in_features),
+            nn.Linear(in_features, in_features)
+        )
+        self.fc2 = nn.Sequential(
+            nn.Linear(x, in_features),
+            nn.Linear(in_features, in_features),
+            nn.Linear(in_features, in_features),
+            nn.Linear(in_features, in_features)
+        )
 
     def forward(self, x):
-        y1 = torch.matmul(x, self.W1)  # -> ONNX MatMul
-        y2 = torch.matmul(x, self.W2)  # -> ONNX MatMul
+        # y1 = torch.matmul(x, self.W1)  # -> ONNX MatMul
+        # y2 = torch.matmul(x, self.W2)  # -> ONNX MatMul
+        y1 = self.fc1(x)
+        y2 = self.fc2(x)
         return y1, y2
 
 
@@ -356,9 +371,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--outdir", type=str, default="./onnx_out")
     ap.add_argument("--batch", type=int, default=4)
-    ap.add_argument("--in-feat", type=int, default=8192)
-    ap.add_argument("--m1", type=int, default=8192)
-    ap.add_argument("--m2", type=int, default=8192)
+    ap.add_argument("--in-feat", type=int, default=2048)
+    ap.add_argument("--m1", type=int, default=2048)
+    ap.add_argument("--m2", type=int, default=2048)
     ap.add_argument("--m3", type=int, default=32)
     ap.add_argument("--opset", type=int, default=13)
     ap.add_argument("--seed", type=int, default=42)
@@ -380,7 +395,7 @@ def main():
     converter.onnx_convert(st_model, outdir / "SymmetricFT.onnx")
     
     # 1) parallel_matmul.onnx
-    m1 = ParallelMatMul(in_features=K, m1=args.m1, m2=args.m2)
+    m1 = ParallelMatMul(x=K, in_features=K, m1=args.m1, m2=args.m2)
     export_onnx(
         m1, x, outdir / "parallel_matmul.onnx",
         opset=args.opset,
