@@ -1,1 +1,3 @@
 onnx_out/
+settings.json
+*.cpython-*
