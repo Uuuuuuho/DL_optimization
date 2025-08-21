@@ -123,3 +123,6 @@ def analyze_memory_patterns(model_path):
         })
     
     return memory_opts
+
+if __name__=="__main__":
+    analyze_onnx_mlir_optimizations("onnx_out/parallel_matmul.onnx")
