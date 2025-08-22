@@ -208,6 +208,37 @@ class SymmetricFusionTransformer(nn.Module):
         return x, None
 
 # -----------------------------
+# 0-b) Vanilla Transformer Decoder
+# -----------------------------
+class TransformerDecoderModel(nn.Module):
+    """
+    Thin wrapper around PyTorch nn.TransformerDecoder for ONNX export.
+    Inputs use batch_first=False: shapes (T, N, E) and (S, N, E).
+    Returns the decoded sequence (T, N, E).
+    """
+    def __init__(self,
+                 d_model: int = 128,
+                 n_head: int = 8,
+                 num_layers: int = 2,
+                 dim_feedforward: int = 512,
+                 dropout: float = 0.1,
+                 batch_first: bool = False):
+        super().__init__()
+        layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=n_head,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=batch_first,
+            activation="relu",
+        )
+        self.decoder = nn.TransformerDecoder(layer, num_layers=num_layers)
+
+    def forward(self, tgt: Tensor, memory: Tensor) -> Tensor:
+        # Export-friendly forward without masks/kv padding for portability
+        return self.decoder(tgt, memory)
+
+# -----------------------------
 # 1) Parallel MatMul (no bias)
 # -----------------------------
 class ParallelMatMul(nn.Module):
@@ -341,6 +372,44 @@ def export_onnx(model: nn.Module,
     print(f"    inputs : {[i.name + str(i.type.tensor_type.shape.dim[0].dim_param or i.type.tensor_type.shape.dim[0].dim_value) for i in m.graph.input]}")
     print(f"    outputs: {[o.name for o in m.graph.output]}")
 
+def export_transformer_decoder_onnx(model: nn.Module,
+                                    tgt: Tensor,
+                                    memory: Tensor,
+                                    out_path: str,
+                                    opset: int = 13,
+                                    dynamic: bool = True):
+    """Export a Transformer decoder with (tgt, memory) inputs to ONNX."""
+    model.eval()
+    out_path = str(out_path)
+    input_names = ["tgt", "memory"]
+    output_names = ["out"]
+    dynamic_axes = None
+    if dynamic:
+        # Allow variable time dims (T for tgt, S for memory) and batch N
+        dynamic_axes = {
+            "tgt": {0: "T", 1: "N"},
+            "memory": {0: "S", 1: "N"},
+            "out": {0: "T", 1: "N"},
+        }
+
+    torch.onnx.export(
+        model,
+        (tgt, memory),
+        out_path,
+        export_params=True,
+        do_constant_folding=True,
+        opset_version=opset,
+        input_names=input_names,
+        output_names=output_names,
+        dynamic_axes=dynamic_axes,
+    )
+
+    m = onnx.load(out_path)
+    oc.check_model(m)
+    print(f"[ok] exported: {out_path}")
+    print(f"    inputs : {[i.name for i in m.graph.input]}")
+    print(f"    outputs: {[o.name for o in m.graph.output]}")
+
 class SimplConverter():
     def __init__(self):
         super().__init__()
@@ -348,24 +417,26 @@ class SimplConverter():
     def onnx_convert(self, model, filepath, N=300):
         model.to("cpu")
         model.eval()
-
         if isinstance(model, SymmetricFusionTransformer):
             st_in_tokens = torch.rand(N, 128, dtype=torch.float32)      # x: (N, d_model)
             st_in_edge = torch.rand(N, N, 128, dtype=torch.float32)     # edge: (N, N, d_edge)
             st_in_mask = torch.randint(0, 2, (N, N)).bool()             # edge_mask: (N, N)
-            
+
             input_sample = (st_in_tokens, st_in_edge, st_in_mask)
             input_names = ['tokens', 'rpe', 'rpes']
             output_names = ['out']
-            
-        torch.onnx.export(
-                        model,
-                        input_sample,
-                        filepath, 
-                        input_names=input_names,
-                        output_names=output_names,
-                        do_constant_folding=True,
-                        export_params=True)
+
+            torch.onnx.export(
+                model,
+                input_sample,
+                str(filepath),
+                input_names=input_names,
+                output_names=output_names,
+                do_constant_folding=True,
+                export_params=True,
+            )
+            return
+        raise NotImplementedError("SimplConverter only supports SymmetricFusionTransformer")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -375,9 +446,13 @@ def main():
     ap.add_argument("--m1", type=int, default=2048)
     ap.add_argument("--m2", type=int, default=2048)
     ap.add_argument("--m3", type=int, default=32)
-    ap.add_argument("--opset", type=int, default=13)
+    ap.add_argument("--opset", type=int, default=17)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--no-dynamic", action="store_true", help="disable dynamic axes")
+    ap.add_argument("--tgt-len", type=int, default=16, help="target sequence length for decoder export")
+    ap.add_argument("--src-len", type=int, default=16, help="memory/source sequence length for decoder export")
+    ap.add_argument("--decoder-layers", type=int, default=2, help="number of decoder layers")
+    ap.add_argument("--decoder-heads", type=int, default=8, help="number of attention heads (d_model must be divisible)")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -392,12 +467,32 @@ def main():
     # 0) SymmetricFT.onnx
     st_model = SymmetricFusionTransformer('cuda:0')
     converter = SimplConverter()
-    converter.onnx_convert(st_model, outdir / "SymmetricFT.onnx")
+    converter.onnx_convert(st_model, str(outdir / "SymmetricFT.onnx"))
+    
+    # 0-b) transformer_decoder.onnx
+    # d_model uses K to match feature size; ensure divisible by heads
+    if (K % args.decoder_heads) != 0:
+        print(f"[warn] in-feat ({K}) is not divisible by decoder-heads ({args.decoder_heads}); adjusting heads to 1 for export.")
+        heads = 1
+    else:
+        heads = args.decoder_heads
+    dec_model = TransformerDecoderModel(d_model=K, n_head=heads, num_layers=args.decoder_layers, dim_feedforward=max(4*K, 256))
+    T, S, B = args.tgt_len, args.src_len, N
+    tgt = torch.randn(T, B, K, dtype=torch.float32)
+    mem = torch.randn(S, B, K, dtype=torch.float32)
+    export_transformer_decoder_onnx(
+        dec_model,
+        tgt,
+        mem,
+        str(outdir / "transformer_decoder.onnx"),
+        opset=args.opset,
+        dynamic=not args.no_dynamic,
+    )
     
     # 1) parallel_matmul.onnx
     m1 = ParallelMatMul(x=K, in_features=K, m1=args.m1, m2=args.m2)
     export_onnx(
-        m1, x, outdir / "parallel_matmul.onnx",
+        m1, x, str(outdir / "parallel_matmul.onnx"),
         opset=args.opset,
         dynamic=not args.no_dynamic,
         names=["Y1", "Y2"]

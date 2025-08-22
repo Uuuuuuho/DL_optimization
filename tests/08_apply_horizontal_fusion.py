@@ -60,8 +60,7 @@ def main():
     try:
         subprocess.check_call(gen_cmd)
     except subprocess.CalledProcessError as e:
-        print(f"Failed to generate hints/edges: {e}")
-        sys.exit(1)
+        print(f"[warn] Failed to generate hints/edges, proceeding without them: {e}")
 
     # Step 2: build command for 01
     run_cmd = [
@@ -69,10 +68,12 @@ def main():
         str(Path(__file__).with_name("01_horizontal_fusion.py")),
         "--in", args.in_model,
         "--out", args.out_model,
-        "--dep-source", "edges-json",
-        "--dep-file", str(edges),
-        "--hints-file", str(hints),
     ]
+    # Pass through disable flags if requested; current 01 CLI doesn't accept hints/edges
+    if args.no_matmul:
+        run_cmd.append("--no-matmul")
+    if args.no_gemm:
+        run_cmd.append("--no-gemm")
 
     if args.show_cmd or not args.run:
         print("[2/2] Command to run 01_horizontal_fusion:")

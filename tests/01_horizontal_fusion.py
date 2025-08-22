@@ -326,7 +326,7 @@ def fuse_matmul_group(A: gs.Tensor, nodes: List[gs.Node], g: gs.Graph, verbose: 
 
     # Detect optional bias Adds that immediately consume each MatMul
     bias_list = []  # may contain None if no bias for that node
-    add_nodes_map = {}  # old_matmul_node -> add_node (if exists)
+    add_nodes_map = {}  # map by stable node key -> add_node (if exists)
     has_any_bias = False
     for n, B in zip(nodes, B_list):
         bias_arr = None
@@ -351,7 +351,7 @@ def fuse_matmul_group(A: gs.Tensor, nodes: List[gs.Node], g: gs.Graph, verbose: 
                     add_node = cand
         bias_list.append(bias_arr)
         if add_node is not None:
-            add_nodes_map[n] = add_node
+            add_nodes_map[nkey(n)] = add_node
             has_any_bias = True
 
     # New MatMul
@@ -408,7 +408,7 @@ def fuse_matmul_group(A: gs.Tensor, nodes: List[gs.Node], g: gs.Graph, verbose: 
         # determine the original public-facing tensor to replace
         orig_final = old_node.outputs[0]
         # if there was an Add consuming the matmul, use that Add's output as the original final
-        add_n = add_nodes_map.get(old_node)
+        add_n = add_nodes_map.get(nkey(old_node))
         if add_n is not None:
             orig_final = add_n.outputs[0]
         _rewire_tensor(orig_final, new_out)
@@ -420,7 +420,7 @@ def fuse_matmul_group(A: gs.Tensor, nodes: List[gs.Node], g: gs.Graph, verbose: 
                 g.nodes.remove(old_node)
         except Exception:
             pass
-        add_n = add_nodes_map.get(old_node)
+        add_n = add_nodes_map.get(nkey(old_node))
         if add_n is not None:
             try:
                 if add_n in g.nodes:

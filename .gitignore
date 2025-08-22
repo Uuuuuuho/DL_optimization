@@ -1,4 +1,5 @@
 onnx_out/
+.venv/
 settings.json
 *.cpython-*
 *.mlir
