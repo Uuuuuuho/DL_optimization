@@ -3,20 +3,28 @@
 """
 Export ONNX model to textual MLIR (ONNX dialect) with optional optimizations.
 
-Defaults: no optimization. You can enable simple ONNX graph optimizations via --opt-level
-without requiring onnx-mlir, and optionally run an external mlir-opt pass pipeline
-on the emitted MLIR if available.
+Defaults: no optimization. You can enable ONNX graph optimizations via --opt-level
+using either onnxoptimizer (conservative) or onnx-simplifier (aggressive) selected by --opt-engine,
+and optionally run an external mlir-opt pass pipeline on the emitted MLIR if available.
 
 Usage:
     # No optimization (default)
     python 11_onnx_to_mlir.py --in onnx_out/parallel_matmul.onnx --out onnx_out/parallel_matmul.mlir
 
-    # With ONNX graph optimization level O2 (requires 'onnxoptimizer')
-    python 11_onnx_to_mlir.py --in model.onnx --out model.mlir --opt-level O2
+    # With ONNX graph optimization level O2 using onnxoptimizer
+    python 11_onnx_to_mlir.py --in model.onnx --out model.mlir --opt-level O2 --opt-engine onnxoptimizer
+
+    # With ONNX graph simplification using onnx-simplifier (if installed)
+    python 11_onnx_to_mlir.py --in model.onnx --out model.mlir --opt-level O2 --opt-engine onnxsim
 
     # Optionally post-process MLIR with mlir-opt pass pipeline
     python 11_onnx_to_mlir.py --in model.onnx --out model.mlir --mlir-opt /usr/bin/mlir-opt \
         --mlir-opt-pipeline 'canonicalize,cse'
+
+    # Use onnx-mlir to emit MLIR with onnx-mlir's optimization level, then (optionally) mlir-opt
+    python 11_onnx_to_mlir.py --in model.onnx --out model.mlir \
+        --onnx-mlir /usr/local/bin/onnx-mlir --onnx-mlir-level O2 \
+        --mlir-opt /usr/bin/mlir-opt --mlir-opt-pipeline 'canonicalize,cse'
 """
 
 from __future__ import annotations
@@ -36,6 +44,12 @@ try:
     import onnxoptimizer  # type: ignore
 except Exception:
     onnxoptimizer = None  # noqa: N816
+
+# Optional: onnx-simplifier (can produce larger simplifications and fusions)
+try:
+    from onnxsim import simplify as onnx_simplify  # type: ignore
+except Exception:
+    onnx_simplify = None  # type: ignore
 
 
 def onnx_dtype_to_mlir_token(elem_type: int) -> str:
@@ -229,18 +243,40 @@ def build_mlir(model: onnx.ModelProto) -> str:
     return "\n".join(lines) + "\n"
 
 
-def optimize_onnx_model(model: onnx.ModelProto, level: str, passes: Optional[List[str]] = None) -> onnx.ModelProto:
-    """Optionally optimize ONNX graph using onnxoptimizer.
+def optimize_onnx_model(
+    model: onnx.ModelProto,
+    level: str,
+    passes: Optional[List[str]] = None,
+    engine: str = "auto",
+) -> onnx.ModelProto:
+    """Optionally optimize ONNX graph.
 
     level: 'O0' (no-op), 'O1', 'O2', 'O3'
     passes: explicit pass list to override defaults for a given level.
+    engine: 'auto'|'onnxoptimizer'|'onnxsim'|'none'
+      - onnxoptimizer: conservative, reproducible ONNX pass pipeline
+      - onnxsim: aggressive simplification, can yield bigger perf/size wins
+      - auto: prefer onnxoptimizer if available else onnxsim; fallback to none
     """
     lvl = (level or "O0").upper()
     if lvl == "O0":
         return model
-    if onnxoptimizer is None:
-        print("[warn] onnxoptimizer not installed; skipping ONNX optimizations.")
-        return model
+
+    def _ensure_node_names(m: onnx.ModelProto) -> onnx.ModelProto:
+        # Some optimizers require unique node names; assign if missing.
+        used: set[str] = set()
+        for i, n in enumerate(m.graph.node):
+            if not n.name:
+                n.name = f"n{i}_{n.op_type}"
+            # de-duplicate if necessary
+            base = n.name
+            if base in used:
+                k = 1
+                while f"{base}_{k}" in used:
+                    k += 1
+                n.name = f"{base}_{k}"
+            used.add(n.name)
+        return m
 
     # Define conservative pass sets by level
     default_sets: Dict[str, List[str]] = {
@@ -295,12 +331,48 @@ def optimize_onnx_model(model: onnx.ModelProto, level: str, passes: Optional[Lis
         ],
     }
     pass_list = passes if passes is not None else default_sets.get(lvl, [])
+    if engine == "none":
+        return model
+    chosen_engine = engine
+    if engine == "auto":
+        if onnxoptimizer is not None:
+            chosen_engine = "onnxoptimizer"
+        elif onnx_simplify is not None:
+            chosen_engine = "onnxsim"
+        else:
+            chosen_engine = "none"
+    if chosen_engine == "onnxsim":
+        if onnx_simplify is None:
+            print("[warn] onnxsim not installed; skipping ONNX optimizations.")
+            return model
+        try:
+            # Note: check_n=True validates that outputs are unchanged numerically.
+            # Dynamic shapes are not enabled by default; set according to your model needs.
+            smodel, success = onnx_simplify(model, check_n=5)
+            if success:
+                return smodel
+            print("[warn] onnxsim simplify() did not report success; returning original model.")
+            return model
+        except Exception as e:
+            print(f"[warn] onnxsim failed ({e}); returning original model.")
+            return model
+
+    if chosen_engine != "onnxoptimizer":
+        return model
+    if onnxoptimizer is None:
+        print("[warn] onnxoptimizer not installed; skipping ONNX optimizations.")
+        return model
     if not pass_list:
         return model
     try:
-        # Some optimizers may require names on all nodes
-        optimized = onnxoptimizer.optimize(model, pass_list)
-        return optimized
+        model = _ensure_node_names(model)
+        # Apply passes one-by-one for robustness: skip failing passes instead of aborting the whole pipeline.
+        for p in pass_list:
+            try:
+                model = onnxoptimizer.optimize(model, [p])
+            except Exception as e:
+                print(f"[warn] pass '{p}' failed in onnxoptimizer ({e}); skipping.")
+        return model
     except Exception as e:
         print(f"[warn] onnxoptimizer failed ({e}); returning original model.")
         return model
@@ -326,14 +398,61 @@ def run_mlir_opt(mlir_text: str, mlir_opt_bin: str, pipeline: str) -> str:
             return mlir_text
 
 
+def run_onnx_mlir_emit_mlir(
+    in_model: onnx.ModelProto,
+    onnx_mlir_bin: str,
+    opt_level: str = "O2",
+    extra_flags: Optional[List[str]] = None,
+) -> Optional[str]:
+    """Run onnx-mlir --EmitMLIR with a given optimization level and return MLIR text.
+
+    Writes the input model to a temporary .onnx file, invokes onnx-mlir in a temp directory,
+    and reads back the generated .mlir text. Returns None on failure.
+    """
+    import subprocess, tempfile, os, shutil
+    lvl = (opt_level or "O2").upper()
+    if lvl not in {"O0", "O1", "O2", "O3"}:
+        lvl = "O2"
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            onnx_path = os.path.join(td, "model.onnx")
+            onnx.save(in_model, onnx_path)
+            cmd = [onnx_mlir_bin, "--EmitMLIR", f"--{lvl}", onnx_path]
+            if extra_flags:
+                cmd[1:1] = list(extra_flags)
+            # Run in temp dir so output goes there (model.onnx.mlir)
+            res = subprocess.run(cmd, cwd=td, check=True, capture_output=True, text=True)
+            mlir_path = onnx_path + ".mlir"
+            if not os.path.exists(mlir_path):
+                # Some versions may drop extension differently; find first .mlir in td
+                cand = None
+                for fn in os.listdir(td):
+                    if fn.endswith(".mlir"):
+                        cand = os.path.join(td, fn)
+                        break
+                if cand is None:
+                    print("[warn] onnx-mlir did not produce a .mlir file; stderr=", res.stderr)
+                    return None
+                mlir_path = cand
+            with open(mlir_path, "r") as f:
+                return f.read()
+    except Exception as e:
+        print(f"[warn] onnx-mlir --EmitMLIR failed ({e}); falling back to Python emitter.")
+        return None
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Export ONNX to textual MLIR (ONNX dialect) without optimization")
     p.add_argument("--in", dest="in_onnx", default="onnx_out/parallel_matmul.onnx", help="Input ONNX model path")
     p.add_argument("--out", dest="out_mlir", default="onnx_out/parallel_matmul.mlir", help="Output MLIR text path")
     p.add_argument("--opt-level", choices=["O0", "O1", "O2", "O3"], default="O0", help="ONNX graph optimization level (requires onnxoptimizer for O1+)")
     p.add_argument("--opt-passes", nargs="*", default=None, help="Explicit onnxoptimizer pass list (overrides --opt-level presets)")
+    p.add_argument("--opt-engine", choices=["auto", "onnxoptimizer", "onnxsim", "none"], default="auto", help="Optimization engine to use for --opt-level > O0")
     p.add_argument("--mlir-opt", dest="mlir_opt_bin", default=None, help="Path to mlir-opt binary to post-process MLIR (optional)")
     p.add_argument("--mlir-opt-pipeline", dest="mlir_opt_pipeline", default="", help="mlir-opt pass pipeline string, e.g. 'canonicalize,cse'")
+    p.add_argument("--onnx-mlir", dest="onnx_mlir_bin", default=None, help="Path to onnx-mlir binary to emit MLIR with onnx-mlir optimizations (optional)")
+    p.add_argument("--onnx-mlir-level", dest="onnx_mlir_level", choices=["O0", "O1", "O2", "O3"], default="O2", help="Optimization level for onnx-mlir --EmitMLIR")
+    p.add_argument("--onnx-mlir-flags", dest="onnx_mlir_flags", nargs="*", default=None, help="Additional flags to pass to onnx-mlir before --EmitMLIR (advanced)")
     return p.parse_args()
 
 
@@ -341,8 +460,14 @@ def main():
     args = parse_args()
     model = onnx.load(args.in_onnx)
     # Optional ONNX graph optimization (pure Python)
-    model = optimize_onnx_model(model, args.opt_level, args.opt_passes)
-    mlir_text = build_mlir(model)
+    model = optimize_onnx_model(model, args.opt_level, args.opt_passes, args.opt_engine)
+    mlir_text: Optional[str] = None
+    # Prefer onnx-mlir emission if provided
+    if args.onnx_mlir_bin:
+        mlir_text = run_onnx_mlir_emit_mlir(model, args.onnx_mlir_bin, args.onnx_mlir_level, args.onnx_mlir_flags)
+    # Fallback to Python emitter
+    if not mlir_text:
+        mlir_text = build_mlir(model)
     # Optional mlir-opt post-pass
     if args.mlir_opt_bin:
         mlir_text = run_mlir_opt(mlir_text, args.mlir_opt_bin, args.mlir_opt_pipeline)

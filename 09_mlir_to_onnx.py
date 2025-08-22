@@ -137,7 +137,12 @@ class MLIRToONNXConverter:
                          for k, v in self.initializers.items()],
             value_info=value_infos,
         )
-        model = helper.make_model(graph, producer_name="mlir_to_onnx", opset_imports=[helper.make_opsetid("", self.opset)])
+        effective_opset = self._min_required_opset()
+        model = helper.make_model(
+            graph,
+            producer_name="mlir_to_onnx",
+            opset_imports=[helper.make_opsetid("", effective_opset)],
+        )
         onnx.checker.check_model(model)
         return model
 
@@ -191,12 +196,15 @@ class MLIRToONNXConverter:
                 attrs_raw = m_op.group(3) or ""
                 operands_part = m_op.group(4).strip()
                 type_part = m_op.group(5).strip()
-                inputs = [tok.strip() for tok in operands_part.split(",") if tok.strip().startswith("%")]
+                # Robust operand parse: find all SSA tokens like %x, %y, ignoring parentheses and types
+                inputs = re.findall(r"%[\w\d_]+", operands_part)
                 attr_dict = self._parse_attrs(attrs_raw)
                 # Fallbacks for required attributes if missing (e.g., Concat.axis)
                 if op == "Concat" and "axis" not in attr_dict:
                     axis = self._infer_concat_axis_from_types(type_part)
                     attr_dict["axis"] = axis
+                # Coerce attribute types for known ops
+                attr_dict = self._coerce_known_attr_types(op, attr_dict)
                 out_name = res[1:]
                 node = helper.make_node(op_type=op, inputs=[self._ssa_to_name(i) for i in inputs], outputs=[out_name], name=out_name, **attr_dict)
                 self.nodes.append(node)
@@ -234,20 +242,46 @@ class MLIRToONNXConverter:
                 except Exception:
                     val = v
             else:
-                if re.match(r"^[+-]?\d+\.?\d*$", v):
-                    if "." in v:
-                        val = float(v)
+                v_clean = v.strip('"')
+                # Prefer int, then float (supports scientific notation)
+                try:
+                    if re.match(r"^[+-]?\d+$", v_clean):
+                        val = int(v_clean)
                     else:
-                        try:
-                            val = int(v)
-                        except Exception:
-                            val = v
-                elif v.lower() in ("true", "false"):
-                    val = v.lower() == "true"
-                else:
-                    val = v.strip('"')
+                        raise ValueError()
+                except Exception:
+                    try:
+                        # float() handles scientific notation '1e-5'
+                        val = float(v_clean)
+                    except Exception:
+                        if v_clean.lower() in ("true", "false"):
+                            val = v_clean.lower() == "true"
+                        else:
+                            val = v_clean
             attrs[k] = val
         return attrs
+
+    def _coerce_known_attr_types(self, op: str, attrs: Dict) -> Dict:
+        """Ensure known attributes have the correct ONNX types (int/float)."""
+        spec: Dict[str, Dict[str, type]] = {
+            "Concat": {"axis": int},
+            "LayerNormalization": {"epsilon": float, "axis": int},
+            "Gemm": {"alpha": float, "beta": float, "transA": int, "transB": int},
+        }
+        want = spec.get(op)
+        if not want:
+            return attrs
+        out = dict(attrs)
+        for k, t in want.items():
+            if k in out:
+                try:
+                    if t is int:
+                        out[k] = int(out[k])
+                    elif t is float:
+                        out[k] = float(out[k])
+                except Exception:
+                    pass
+        return out
 
     def _split_top_level(self, s: str, sep: str) -> List[str]:
         parts: List[str] = []
@@ -415,6 +449,30 @@ class MLIRToONNXConverter:
         if np_dtype == np.bool_:
             return TensorProto.BOOL
         return TensorProto.UNDEFINED
+
+    def _min_required_opset(self) -> int:
+        """Determine minimal required opset based on used operators."""
+        min_for_op: Dict[str, int] = {
+            # conservative mapping; extend as needed
+            "LayerNormalization": 17,
+            "Gelu": 20,
+            # common ops exist since very early opsets
+            "Concat": 1,
+            "MatMul": 1,
+            "Gemm": 1,
+            "Add": 1,
+            "Relu": 1,
+            "Mul": 1,
+            "Sub": 1,
+            "Div": 1,
+            "Sigmoid": 1,
+            "Tanh": 1,
+            "Conv": 1,
+        }
+        req = self.opset
+        for n in self.nodes:
+            req = max(req, min_for_op.get(n.op_type, self.opset))
+        return req
 
 
 # ------------------------------
