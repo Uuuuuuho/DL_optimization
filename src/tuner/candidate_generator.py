@@ -46,14 +46,11 @@ def _is_const_tensor(t: gs.Variable) -> bool:
 
 
 def _horizontal_fuse(graph: "gs.Graph", min_group: int = 2, allow_matmul: bool = True, allow_gemm: bool = True) -> int:
-    """Horizontally fuse parallel MatMul/Gemm nodes that share the same left input and have constant right inputs.
+    """Horizontally fuse MatMul/Gemm that share the same canonical left input and constant right inputs.
 
-    Strategy:
-      - Group MatMul(A, Wi) by A when Wi are Constant 2D [K, Ni]. Fuse by concatenating Wi along axis=1 to Wcat,
-        compute Y = MatMul(A, Wcat), then Split Y along last dim into original outputs in order.
-      - Similarly for Gemm(A, Wi, Bi) with trans flags (0, 0). Biases are concatenated accordingly.
-    Returns number of groups fused.
-    Limitations: Skips mixed dtypes, non-2D weights, transposed flags, dynamic weight inputs, or small groups.
+    - MatMul(A, Wi) -> concat W along N, single MatMul(A, Wcat) + Split on last dim.
+    - Gemm(A, Wi, Bi) with transA/transB==0 -> concat W and B similarly.
+    Returns number of fused groups.
     """
     try:
         import onnx_graphsurgeon as gs  # type: ignore
@@ -62,10 +59,27 @@ def _horizontal_fuse(graph: "gs.Graph", min_group: int = 2, allow_matmul: bool =
 
     fused_groups = 0
 
-    def fuse_by_op(op_name: str):
+    def _canonical_left_input(v: gs.Variable) -> gs.Variable:
+        """Follow trivial Identity producers to a canonical source variable."""
+        seen: set[int] = set()
+        cur = v
+        for _ in range(8):
+            vid = id(cur)
+            if vid in seen:
+                break
+            seen.add(vid)
+            if getattr(cur, "inputs", None) and len(cur.inputs) == 1:
+                prod = cur.inputs[0]
+                if prod and getattr(prod, "op", None) == "Identity" and prod.inputs and isinstance(prod.inputs[0], gs.Variable):
+                    cur = prod.inputs[0]
+                    continue
+            break
+        return cur
+
+    def fuse_by_op(op_name: str) -> None:
         nonlocal fused_groups
-        # Collect candidates grouped by left input tensor identity
-        groups: dict[gs.Variable, list[gs.Node]] = {}
+        groups: Dict[int, List[gs.Node]] = {}
+        left_by_key: Dict[int, gs.Variable] = {}
         for n in list(graph.nodes):
             if n.op != op_name:
                 continue
@@ -78,40 +92,41 @@ def _horizontal_fuse(graph: "gs.Graph", min_group: int = 2, allow_matmul: bool =
                 wv = np.array(w.values)
                 if wv.ndim != 2:
                     continue
-                groups.setdefault(a, []).append(n)
-            elif op_name == "Gemm":
+                a_can = _canonical_left_input(a)
+                key = id(a_can)
+                groups.setdefault(key, []).append(n)
+                left_by_key[key] = a_can
+            else:  # Gemm
                 if len(n.inputs) < 2:
                     continue
                 a, w = n.inputs[:2]
                 if not isinstance(a, gs.Variable) or not isinstance(w, gs.Constant):
                     continue
-                # Only handle non-transposed flags
-                ta = int(n.attrs.get("transA", 0))
-                tb = int(n.attrs.get("transB", 0))
+                ta = int(n.attrs.get("transA", 0)); tb = int(n.attrs.get("transB", 0))
                 if ta != 0 or tb != 0:
                     continue
                 wv = np.array(w.values)
                 if wv.ndim != 2:
                     continue
-                groups.setdefault(a, []).append(n)
+                a_can = _canonical_left_input(a)
+                key = id(a_can)
+                groups.setdefault(key, []).append(n)
+                left_by_key[key] = a_can
 
-        # For each group, attempt fusion
-        for a, nodes in list(groups.items()):
+        for key, nodes in list(groups.items()):
             if len(nodes) < max(1, int(min_group)):
                 continue
-            # Maintain original order as in graph.nodes
-            nodes = sorted(nodes, key=lambda n: graph.nodes.index(n))
+            nodes = sorted(nodes, key=lambda nn: graph.nodes.index(nn))
 
-            # Validate dtypes and K alignment
-            weights: list[np.ndarray] = []
-            biases: list[np.ndarray] = []
-            outs: list[gs.Variable] = []
+            weights: List[np.ndarray] = []
+            biases: List[np.ndarray] = []
+            outs: List[gs.Variable] = []
             dtype = None
             K = None
             ok = True
-            for n in nodes:
+            for nn in nodes:
                 if op_name == "MatMul":
-                    _, w = n.inputs
+                    _, w = nn.inputs
                     wv = np.array(w.values)
                     if dtype is None:
                         dtype = wv.dtype
@@ -122,12 +137,12 @@ def _horizontal_fuse(graph: "gs.Graph", min_group: int = 2, allow_matmul: bool =
                     if int(wv.shape[0]) != K:
                         ok = False; break
                     weights.append(wv)
-                    outs.append(n.outputs[0])
-                else:  # Gemm
-                    _, w = n.inputs[:2]
+                    outs.append(nn.outputs[0])
+                else:
+                    _, w = nn.inputs[:2]
                     bvec = None
-                    if len(n.inputs) >= 3 and isinstance(n.inputs[2], gs.Constant):
-                        bvec = np.array(n.inputs[2].values)
+                    if len(nn.inputs) >= 3 and isinstance(nn.inputs[2], gs.Constant):
+                        bvec = np.array(nn.inputs[2].values)
                     wv = np.array(w.values)
                     if dtype is None:
                         dtype = wv.dtype
@@ -140,11 +155,10 @@ def _horizontal_fuse(graph: "gs.Graph", min_group: int = 2, allow_matmul: bool =
                     if bvec is None:
                         bvec = np.zeros((int(wv.shape[1]),), dtype=wv.dtype)
                     else:
-                        # ensure 1D
                         bvec = bvec.reshape((-1,))
                     weights.append(wv)
                     biases.append(bvec)
-                    outs.append(n.outputs[0])
+                    outs.append(nn.outputs[0])
 
             if not ok or not weights:
                 continue
@@ -157,21 +171,19 @@ def _horizontal_fuse(graph: "gs.Graph", min_group: int = 2, allow_matmul: bool =
             except Exception:
                 continue
 
-            # Build fused nodes
-            w_const = gs.Constant(name=f"{a.name}_{op_name}_Wcat", values=Wcat)
+            left_in = left_by_key.get(key, nodes[0].inputs[0])
+            w_const = gs.Constant(name=f"{left_in.name}_{op_name}_Wcat", values=Wcat)
             y_fused = gs.Variable(name=f"{outs[0].name}_{op_name}_fused", dtype=outs[0].dtype, shape=None)
 
             if op_name == "MatMul":
-                fused = gs.Node(op="MatMul", inputs=[a, w_const], outputs=[y_fused])
+                fused = gs.Node(op="MatMul", inputs=[left_in, w_const], outputs=[y_fused])
             else:
-                b_const = gs.Constant(name=f"{a.name}_{op_name}_Bcat", values=Bcat)
-                fused = gs.Node(op="Gemm", inputs=[a, w_const, b_const], outputs=[y_fused], attrs={"alpha": 1.0, "beta": 1.0, "transA": 0, "transB": 0})
+                b_const = gs.Constant(name=f"{left_in.name}_{op_name}_Bcat", values=Bcat)
+                fused = gs.Node(op="Gemm", inputs=[left_in, w_const, b_const], outputs=[y_fused], attrs={"alpha": 1.0, "beta": 1.0, "transA": 0, "transB": 0})
 
-            # Split fused output back to original outputs
-            split_attrs = {"axis": -1, "split": Ns}
-            split = gs.Node(op="Split", inputs=[y_fused], outputs=outs, attrs=split_attrs)
+            split_sizes = gs.Constant(name=f"split_sizes_{y_fused.name}", values=np.array(Ns, dtype=np.int64))
+            split = gs.Node(op="Split", inputs=[y_fused, split_sizes], outputs=outs, attrs={"axis": -1})
 
-            # Insert fused + split before the first node of the group
             try:
                 idx0 = graph.nodes.index(nodes[0])
             except ValueError:
@@ -179,9 +191,8 @@ def _horizontal_fuse(graph: "gs.Graph", min_group: int = 2, allow_matmul: bool =
             graph.nodes.insert(idx0, fused)
             graph.nodes.insert(idx0 + 1, split)
 
-            # Remove old nodes by detaching outputs
-            for n in nodes:
-                n.outputs = []
+            for nn in nodes:
+                nn.outputs = []
 
             fused_groups += 1
 

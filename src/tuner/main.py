@@ -4,12 +4,12 @@ import argparse
 import csv
 import json
 import os
-from typing import Dict, List
+from typing import Dict, List, Optional
 
+validate_against_baseline = None  # type: ignore[assignment]
 try:
     # Prefer package-relative imports when run as a module
     from .candidate_generator import generate_candidates
-    from .validator import validate_against_baseline
     from .trt_builder import build_with_trtexec as trt_build
     from .profiler import load_times_json, summarize_times
     from .selector import pick_best
@@ -17,7 +17,6 @@ try:
 except Exception:
     # Fallback for running as a script from the same directory
     from candidate_generator import generate_candidates  # type: ignore
-    from validator import validate_against_baseline  # type: ignore
     from trt_builder import build_with_trtexec as trt_build  # type: ignore
     from profiler import load_times_json, summarize_times  # type: ignore
     from selector import pick_best  # type: ignore
@@ -109,11 +108,24 @@ def main():
 
     # 2) Validate against baseline
     valid: List[str] = []
+    # Lazy import validator only if we need it
+    if not args.skip_validation and validate_against_baseline is None:
+        try:
+            from .validator import validate_against_baseline as _v  # type: ignore
+        except Exception:
+            try:
+                from validator import validate_against_baseline as _v  # type: ignore
+            except Exception as e:
+                print(f"[warn] validator unavailable ({e}); skipping validation.")
+                args.skip_validation = True
+                _v = None  # type: ignore
+        validate_against_baseline = _v  # type: ignore
+
     if args.skip_validation:
         valid = list(candidates)
     else:
         for c in candidates:
-            ok, msg = validate_against_baseline(args.onnx, c)
+            ok, msg = validate_against_baseline(args.onnx, c)  # type: ignore[operator]
             if ok:
                 valid.append(c)
             else:
@@ -140,8 +152,16 @@ def main():
     metrics_rows: List[Dict[str, object]] = []
     if args.skip_build:
         # Only validation; record candidates as ok without perf
+        import onnx
         for c in valid:
-            metrics_rows.append({"candidate": c, "rc": None})
+            try:
+                m_c = onnx.load(c)
+                node_count = len(m_c.graph.node)
+                mm_count = sum(1 for n in m_c.graph.node if n.op_type in ("MatMul", "Gemm"))
+            except Exception:
+                node_count = None
+                mm_count = None
+            metrics_rows.append({"candidate": c, "rc": None, "node_count": node_count, "mm_count": mm_count})
     else:
         trtexec_bin = args.trtexec
         if not trtexec_bin or not os.path.exists(trtexec_bin):

@@ -12,8 +12,14 @@ def pick_best(metrics: List[Dict[str, Any]]) -> Dict[str, Any]:
         ml = m.get("meanLatency")
         if ml is None:
             ml = m.get("mean_ms", float("inf"))
+        # Prefer fewer nodes when no latency metric (skip-build mode)
+        nc = m.get("node_count")
         bt = m.get("build_time_s", float("inf"))
-        return (ml if ml is not None else float("inf"), bt)
+        return (
+            ml if ml is not None else float("inf"),
+            nc if isinstance(nc, (int, float)) else float("inf"),
+            bt,
+        )
 
     return sorted(metrics, key=key)[0]
 
