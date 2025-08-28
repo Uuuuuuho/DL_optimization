@@ -7,6 +7,7 @@ A small, extensible toolkit that searches TensorRT-friendly frontend graph varia
   - K-dimension alignment for MatMul via zero-padding of A and B (K→multiple of {8,16,32}).
   - MatMul → Gemm rewrite when weights are constant.
   - Optional onnx-simplifier for graph cleanup.
+  - Built-in Horizontal Fusion: parallel MatMul/Gemm with the same left input and constant weights are fused into a single op (weights concatenated along N, result split back). Safe/lossless within supported patterns.
 - Validator: onnx.checker + ONNX Runtime-based numeric check against baseline.
 - TensorRT engine builder via `trtexec` with timing cache reuse and shapes handling.
 - Profiler: collects latency metrics from `--exportTimes` and summary logs.
@@ -44,6 +45,33 @@ export LD_LIBRARY_PATH=/usr/local/cuda-12.2/lib64:/mnt/e/Downloads/TensorRT-8.6.
 - `logs/`: trtexec logs and JSONs.
 - `metrics.csv`: per-candidate metrics.
 - `best.onnx` and optionally `best.plan`.
+
+### Horizontal Fusion options
+- Enable internal horizontal fusion candidates:
+
+```
+--enable-hfusion
+```
+
+- Explore multiple minimum group sizes in one run using ranges/lists. Supported formats:
+  - Single: `--hf-min-group 2`
+  - Range inclusive: `--hf-min-group 2-5`  (2,3,4,5)
+  - Range with step: `--hf-min-group 2-8:2`  (2,4,6,8)
+  - Comma list: `--hf-min-group 2,4,8`
+
+Example:
+
+```
+python -m tuner.main \
+  --onnx onnx_out/parallel_matmul.onnx \
+  --outdir onnx_out/tune_run \
+  --trtexec /usr/src/tensorrt/bin/trtexec \
+  --precision FP16 \
+  --enable-hfusion \
+  --hf-min-group 2-6:2
+```
+
+This generates separate h-fusion candidates per group size (e.g., g2, g4, g6) and benchmarks them.
 
 ## Notes
 - This is an initial, safe set of transforms. Layout conversions and complex activation/norm rewrites are scaffolded for future phases.

@@ -45,6 +45,156 @@ def _is_const_tensor(t: gs.Variable) -> bool:
     return isinstance(t, gs.Constant)
 
 
+def _horizontal_fuse(graph: "gs.Graph", min_group: int = 2, allow_matmul: bool = True, allow_gemm: bool = True) -> int:
+    """Horizontally fuse parallel MatMul/Gemm nodes that share the same left input and have constant right inputs.
+
+    Strategy:
+      - Group MatMul(A, Wi) by A when Wi are Constant 2D [K, Ni]. Fuse by concatenating Wi along axis=1 to Wcat,
+        compute Y = MatMul(A, Wcat), then Split Y along last dim into original outputs in order.
+      - Similarly for Gemm(A, Wi, Bi) with trans flags (0, 0). Biases are concatenated accordingly.
+    Returns number of groups fused.
+    Limitations: Skips mixed dtypes, non-2D weights, transposed flags, dynamic weight inputs, or small groups.
+    """
+    try:
+        import onnx_graphsurgeon as gs  # type: ignore
+    except Exception:
+        return 0
+
+    fused_groups = 0
+
+    def fuse_by_op(op_name: str):
+        nonlocal fused_groups
+        # Collect candidates grouped by left input tensor identity
+        groups: dict[gs.Variable, list[gs.Node]] = {}
+        for n in list(graph.nodes):
+            if n.op != op_name:
+                continue
+            if op_name == "MatMul":
+                if len(n.inputs) != 2:
+                    continue
+                a, w = n.inputs
+                if not isinstance(a, gs.Variable) or not isinstance(w, gs.Constant):
+                    continue
+                wv = np.array(w.values)
+                if wv.ndim != 2:
+                    continue
+                groups.setdefault(a, []).append(n)
+            elif op_name == "Gemm":
+                if len(n.inputs) < 2:
+                    continue
+                a, w = n.inputs[:2]
+                if not isinstance(a, gs.Variable) or not isinstance(w, gs.Constant):
+                    continue
+                # Only handle non-transposed flags
+                ta = int(n.attrs.get("transA", 0))
+                tb = int(n.attrs.get("transB", 0))
+                if ta != 0 or tb != 0:
+                    continue
+                wv = np.array(w.values)
+                if wv.ndim != 2:
+                    continue
+                groups.setdefault(a, []).append(n)
+
+        # For each group, attempt fusion
+        for a, nodes in list(groups.items()):
+            if len(nodes) < max(1, int(min_group)):
+                continue
+            # Maintain original order as in graph.nodes
+            nodes = sorted(nodes, key=lambda n: graph.nodes.index(n))
+
+            # Validate dtypes and K alignment
+            weights: list[np.ndarray] = []
+            biases: list[np.ndarray] = []
+            outs: list[gs.Variable] = []
+            dtype = None
+            K = None
+            ok = True
+            for n in nodes:
+                if op_name == "MatMul":
+                    _, w = n.inputs
+                    wv = np.array(w.values)
+                    if dtype is None:
+                        dtype = wv.dtype
+                    if dtype != wv.dtype:
+                        ok = False; break
+                    if K is None:
+                        K = int(wv.shape[0])
+                    if int(wv.shape[0]) != K:
+                        ok = False; break
+                    weights.append(wv)
+                    outs.append(n.outputs[0])
+                else:  # Gemm
+                    _, w = n.inputs[:2]
+                    bvec = None
+                    if len(n.inputs) >= 3 and isinstance(n.inputs[2], gs.Constant):
+                        bvec = np.array(n.inputs[2].values)
+                    wv = np.array(w.values)
+                    if dtype is None:
+                        dtype = wv.dtype
+                    if dtype != wv.dtype:
+                        ok = False; break
+                    if K is None:
+                        K = int(wv.shape[0])
+                    if int(wv.shape[0]) != K:
+                        ok = False; break
+                    if bvec is None:
+                        bvec = np.zeros((int(wv.shape[1]),), dtype=wv.dtype)
+                    else:
+                        # ensure 1D
+                        bvec = bvec.reshape((-1,))
+                    weights.append(wv)
+                    biases.append(bvec)
+                    outs.append(n.outputs[0])
+
+            if not ok or not weights:
+                continue
+
+            Ns = [int(w.shape[1]) for w in weights]
+            try:
+                Wcat = np.concatenate(weights, axis=1)
+                if op_name == "Gemm":
+                    Bcat = np.concatenate(biases, axis=0) if biases else np.zeros((sum(Ns),), dtype=dtype)
+            except Exception:
+                continue
+
+            # Build fused nodes
+            w_const = gs.Constant(name=f"{a.name}_{op_name}_Wcat", values=Wcat)
+            y_fused = gs.Variable(name=f"{outs[0].name}_{op_name}_fused", dtype=outs[0].dtype, shape=None)
+
+            if op_name == "MatMul":
+                fused = gs.Node(op="MatMul", inputs=[a, w_const], outputs=[y_fused])
+            else:
+                b_const = gs.Constant(name=f"{a.name}_{op_name}_Bcat", values=Bcat)
+                fused = gs.Node(op="Gemm", inputs=[a, w_const, b_const], outputs=[y_fused], attrs={"alpha": 1.0, "beta": 1.0, "transA": 0, "transB": 0})
+
+            # Split fused output back to original outputs
+            split_attrs = {"axis": -1, "split": Ns}
+            split = gs.Node(op="Split", inputs=[y_fused], outputs=outs, attrs=split_attrs)
+
+            # Insert fused + split before the first node of the group
+            try:
+                idx0 = graph.nodes.index(nodes[0])
+            except ValueError:
+                idx0 = len(graph.nodes)
+            graph.nodes.insert(idx0, fused)
+            graph.nodes.insert(idx0 + 1, split)
+
+            # Remove old nodes by detaching outputs
+            for n in nodes:
+                n.outputs = []
+
+            fused_groups += 1
+
+    if allow_matmul:
+        fuse_by_op("MatMul")
+    if allow_gemm:
+        fuse_by_op("Gemm")
+
+    if fused_groups:
+        graph.cleanup()
+    return fused_groups
+
+
 def _align_k_for_matmul(graph: gs.Graph, multiples: List[int]) -> int:
     """Pad K dimension (shared dim) of MatMul inputs/weights to align to preferred multiples.
     Only when right input is a constant weight [K, N] and left input has shape [*, K].
@@ -151,7 +301,7 @@ def generate_candidates(
     use_simplifier: bool = True,
     seed: int = 0,
     enable_hfusion: bool = False,
-    min_group_size: int = 2,
+    min_group_sizes: List[int] | None = None,
     disable_matmul: bool = False,
     disable_gemm: bool = False,
 ) -> List[str]:
@@ -181,17 +331,20 @@ def generate_candidates(
 
     # Optional: Horizontal Fusion candidate using repo scripts
     if enable_hfusion:
-        hf_out = os.path.join(out_dir, f"candidate_{len(paths):02d}_hfusion.onnx")
-        ok = _try_horizontal_fusion(
-            in_model=onnx_path,
-            out_model=hf_out,
-            work_dir=os.path.join(out_dir, "hfusion"),
-            min_group_size=min_group_size,
-            no_matmul=disable_matmul,
-            no_gemm=disable_gemm,
-        )
-        if ok:
-            paths.append(hf_out)
+        groups = sorted({g for g in (min_group_sizes or [2]) if g and g > 0})
+        for gsz in groups:
+            tag = f"hfusion_g{gsz}"
+            hf_out = os.path.join(out_dir, f"candidate_{len(paths):02d}_{tag}.onnx")
+            ok = _try_horizontal_fusion(
+                in_model=onnx_path,
+                out_model=hf_out,
+                work_dir=os.path.join(out_dir, f"hfusion_g{gsz}"),
+                min_group_size=gsz,
+                no_matmul=disable_matmul,
+                no_gemm=disable_gemm,
+            )
+            if ok:
+                paths.append(hf_out)
 
     # Candidate: MatMul->Gemm
     g = gs.import_onnx(copy.deepcopy(base))
@@ -250,27 +403,26 @@ def _try_horizontal_fusion(
     no_matmul: bool,
     no_gemm: bool,
 ) -> bool:
-    """Invoke repo's 08_apply_horizontal_fusion.py to produce a fused model."""
-    # Locate the script at repo root relative to this file: src/tuner/.. -> repo root
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
-    script = os.path.join(repo_root, "08_apply_horizontal_fusion.py")
-    if not os.path.exists(script):
-        return False
-    cmd = [
-        sys.executable,
-        script,
-        "--in", in_model,
-        "--out", out_model,
-        "--work-dir", work_dir,
-        "--min-group-size", str(min_group_size),
-        "--run",
-    ]
-    if no_matmul:
-        cmd.append("--no-matmul")
-    if no_gemm:
-        cmd.append("--no-gemm")
+    """Perform horizontal fusion internally without calling external modules.
+
+    Fuses groups of MatMul/Gemm sharing the same left input with constant weights.
+    Returns True if a model was written (fused or passthrough when no groups).
+    """
     try:
-        subprocess.check_call(cmd)
+        m = onnx.load(in_model)
+        # Import to GS graph
+        g = gs.import_onnx(m)
+        fused_cnt = _horizontal_fuse(
+            g,
+            min_group=min_group_size,
+            allow_matmul=not no_matmul,
+            allow_gemm=not no_gemm,
+        )
+        # Export back to ONNX
+        m_out = gs.export_onnx(g)
+        m_out = _polish_toposort(m_out)
+        os.makedirs(os.path.dirname(out_model), exist_ok=True)
+        _save_model(m_out, out_model)
         return os.path.exists(out_model)
-    except subprocess.CalledProcessError:
+    except Exception:
         return False

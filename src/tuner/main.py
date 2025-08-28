@@ -50,7 +50,7 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     # Horizontal Fusion controls
     p.add_argument("--enable-hfusion", action="store_true", help="Try horizontal fusion via 08_apply_horizontal_fusion.py")
-    p.add_argument("--hf-min-group", type=int, default=2, help="Min group size for h-fusion hints")
+    p.add_argument("--hf-min-group", default="2", help="Min group size(s) for h-fusion, e.g. '2', '2-5', '2-8:2', or '2,4,8'")
     p.add_argument("--hf-no-matmul", action="store_true", help="Disable MatMul grouping for h-fusion hints")
     p.add_argument("--hf-no-gemm", action="store_true", help="Disable Gemm grouping for h-fusion hints")
     p.add_argument("--skip-build", action="store_true", help="Skip TensorRT build & profiling; only validate candidates")
@@ -67,13 +67,42 @@ def main():
     if args.save_plan:
         os.makedirs(plans_dir, exist_ok=True)
 
+    # Helpers
+    def _parse_int_ranges(spec: str) -> List[int]:
+        vals: set[int] = set()
+        if not spec:
+            return [2]
+        parts = [s.strip() for s in str(spec).split(",") if s.strip()]
+        for tok in parts or [str(spec)]:
+            if "-" in tok:
+                # A-B[:S]
+                try:
+                    rng, *step = tok.split(":")
+                    a_str, b_str = rng.split("-")
+                    a = int(a_str); b = int(b_str)
+                    s = int(step[0]) if step else 1
+                    if s == 0:
+                        continue
+                    lo, hi = (a, b) if a <= b else (b, a)
+                    vals.update(range(lo, hi + 1, abs(s)))
+                except Exception:
+                    continue
+            else:
+                try:
+                    v = int(tok)
+                    vals.add(v)
+                except Exception:
+                    continue
+        out = sorted({v for v in vals if v and v > 0})
+        return out or [2]
+
     # 1) Generate candidates
     candidates = generate_candidates(
         args.onnx, cand_dir,
         use_simplifier=args.simplify,
         seed=args.seed,
         enable_hfusion=args.enable_hfusion,
-        min_group_size=args.hf_min_group,
+        min_group_sizes=_parse_int_ranges(args.hf_min_group),
         disable_matmul=args.hf_no_matmul,
         disable_gemm=args.hf_no_gemm,
     )
